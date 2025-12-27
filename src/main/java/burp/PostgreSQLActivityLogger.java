@@ -17,6 +17,7 @@ import java.util.stream.Collectors;
 import java.util.Arrays;
 import java.util.Base64;
 import java.nio.charset.StandardCharsets;
+import java.util.regex.Pattern;
 
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.http.message.requests.HttpRequest;
@@ -27,13 +28,15 @@ import burp.api.montoya.extension.ExtensionUnloadingHandler;
 /**
  * Handle the recording of the activities into PostgreSQL database.
  * Uses async writes with a background thread for improved performance.
+ * NOW SUPPORTS DYNAMIC TABLE NAMES based on target.
  */
 class PostgreSQLActivityLogger implements ActivityStorage {
 
     /**
      * SQL instructions for PostgreSQL.
+     * NOW USING DYNAMIC TABLE NAMES - these are templates with placeholders
      */
-    private static final String SQL_TABLE_CREATE = "CREATE TABLE IF NOT EXISTS ACTIVITY (" +
+    private static final String SQL_TABLE_CREATE_TEMPLATE = "CREATE TABLE IF NOT EXISTS %s (" +
             "id SERIAL PRIMARY KEY, " +
             "local_source_ip TEXT, " +
             "target_url TEXT, " +
@@ -61,7 +64,7 @@ class PostgreSQLActivityLogger implements ActivityStorage {
             "response_body_is_base64 BOOLEAN DEFAULT FALSE, " +
             "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)";
 
-    private static final String SQL_TABLE_INSERT = "INSERT INTO ACTIVITY " +
+    private static final String SQL_TABLE_INSERT_TEMPLATE = "INSERT INTO %s " +
             "(local_source_ip, target_url, http_method, burp_tool, send_datetime, " +
             "request_raw, request_headers, request_body, request_size, request_content_type, " +
             "response_raw, response_headers, response_body, response_size, " +
@@ -70,12 +73,12 @@ class PostgreSQLActivityLogger implements ActivityStorage {
             "response_raw_is_base64, response_body_is_base64) " +
             "VALUES(?,?,?,?,?::timestamp,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
 
-    private static final String SQL_COUNT_RECORDS = "SELECT COUNT(http_method) FROM ACTIVITY";
-    private static final String SQL_TOTAL_AMOUNT_DATA_SENT = "SELECT SUM(request_size) FROM ACTIVITY WHERE request_size IS NOT NULL";
-    private static final String SQL_BIGGEST_REQUEST_AMOUNT_DATA_SENT = "SELECT MAX(request_size) FROM ACTIVITY WHERE request_size IS NOT NULL";
-    private static final String SQL_MAX_HITS_BY_SECOND = "SELECT COUNT(request_raw) AS hits, " +
+    private static final String SQL_COUNT_RECORDS_TEMPLATE = "SELECT COUNT(http_method) FROM %s";
+    private static final String SQL_TOTAL_AMOUNT_DATA_SENT_TEMPLATE = "SELECT SUM(request_size) FROM %s WHERE request_size IS NOT NULL";
+    private static final String SQL_BIGGEST_REQUEST_AMOUNT_DATA_SENT_TEMPLATE = "SELECT MAX(request_size) FROM %s WHERE request_size IS NOT NULL";
+    private static final String SQL_MAX_HITS_BY_SECOND_TEMPLATE = "SELECT COUNT(request_raw) AS hits, " +
             "DATE_TRUNC('second', send_datetime) as second_bucket " +
-            "FROM ACTIVITY GROUP BY second_bucket ORDER BY hits DESC LIMIT 1";
+            "FROM %s GROUP BY second_bucket ORDER BY hits DESC LIMIT 1";
 
     /**
      * Maximum queue size to prevent memory issues
@@ -93,6 +96,16 @@ class PostgreSQLActivityLogger implements ActivityStorage {
     private static final long BATCH_TIMEOUT_MS = 1000;
 
     /**
+     * Pattern for validating table names (PostgreSQL identifier rules)
+     */
+    private static final Pattern TABLE_NAME_PATTERN = Pattern.compile("^[a-zA-Z_][a-zA-Z0-9_]*$");
+    
+    /**
+     * Default table name if none is provided
+     */
+    private static final String DEFAULT_TABLE_NAME = "burp_activity";
+
+    /**
      * Use a single DB connection for performance.
      */
     private Connection storageConnection;
@@ -105,6 +118,11 @@ class PostgreSQLActivityLogger implements ActivityStorage {
     private String database;
     private String username;
     private String password;
+
+    /**
+     * Current table name for logging (can be changed dynamically)
+     */
+    private volatile String currentTableName = DEFAULT_TABLE_NAME;
 
     /**
      * Ref on project logger.
@@ -257,6 +275,75 @@ class PostgreSQLActivityLogger implements ActivityStorage {
             return content;
         }
     }
+    
+    /**
+     * Validate table name according to PostgreSQL identifier rules
+     * @param tableName Table name to validate
+     * @return true if valid, false otherwise
+     */
+    private boolean isValidTableName(String tableName) {
+        if (tableName == null || tableName.trim().isEmpty()) {
+            return false;
+        }
+        String trimmedName = tableName.trim();
+        return TABLE_NAME_PATTERN.matcher(trimmedName).matches() && trimmedName.length() <= 63;
+    }
+    
+    /**
+     * Sanitize table name for safe use in SQL (basic protection)
+     * @param tableName Raw table name
+     * @return Sanitized table name or default if invalid
+     */
+    private String sanitizeTableName(String tableName) {
+        if (!isValidTableName(tableName)) {
+            trace.writeLog("Invalid table name provided: '" + tableName + "'. Using default: " + DEFAULT_TABLE_NAME);
+            return DEFAULT_TABLE_NAME;
+        }
+        return tableName.trim().toLowerCase();
+    }
+    
+    /**
+     * Create table if it doesn't exist
+     * @param tableName Name of the table to create
+     * @throws Exception If table creation fails
+     */
+    private void createTableIfNotExists(String tableName) throws Exception {
+        ensureDBState();
+        String safeTableName = sanitizeTableName(tableName);
+        
+        String createSQL = String.format(SQL_TABLE_CREATE_TEMPLATE, safeTableName);
+        try (Statement stmt = this.storageConnection.createStatement()) {
+            stmt.execute(createSQL);
+            trace.writeLog("Table '" + safeTableName + "' ensured to exist.");
+        }
+    }
+
+    /**
+     * Set the current table name for logging
+     * @param tableName New table name to use
+     */
+    public void setTableName(String tableName) {
+        String newTableName = sanitizeTableName(tableName);
+        if (!newTableName.equals(this.currentTableName)) {
+            this.currentTableName = newTableName;
+            trace.writeLog("Table name changed to: " + newTableName);
+            
+            // Ensure the new table exists
+            try {
+                createTableIfNotExists(newTableName);
+            } catch (Exception e) {
+                trace.writeLog("Warning: Could not ensure table '" + newTableName + "' exists: " + e.getMessage());
+            }
+        }
+    }
+    
+    /**
+     * Get the current table name
+     * @return Current table name
+     */
+    public String getTableName() {
+        return currentTableName;
+    }
 
     /**
      * Constructor.
@@ -285,7 +372,7 @@ class PostgreSQLActivityLogger implements ActivityStorage {
     }
 
     /**
-     * Initialize the database connection and create table if needed
+     * Initialize the database connection and create default table if needed
      */
     private void initializeConnection() throws Exception {
         String url = String.format("jdbc:postgresql://%s:%d/%s", host, port, database);
@@ -293,10 +380,8 @@ class PostgreSQLActivityLogger implements ActivityStorage {
         this.storageConnection.setAutoCommit(true);
         this.trace.writeLog("Connected to PostgreSQL database at " + host + ":" + port + "/" + database);
         
-        try (Statement stmt = this.storageConnection.createStatement()) {
-            stmt.execute(SQL_TABLE_CREATE);
-            this.trace.writeLog("PostgreSQL recording table initialized.");
-        }
+        // Create default table on initialization
+        createTableIfNotExists(DEFAULT_TABLE_NAME);
     }
 
     /**
@@ -366,10 +451,15 @@ class PostgreSQLActivityLogger implements ActivityStorage {
     private void writeBatch(EnhancedLogEvent[] batch, int count) throws Exception {
         ensureDBState();
         
+        // Ensure the current table exists before writing
+        createTableIfNotExists(currentTableName);
+        
         // Use batch inserts for better performance
         this.storageConnection.setAutoCommit(false);
         
-        try (PreparedStatement stmt = this.storageConnection.prepareStatement(SQL_TABLE_INSERT)) {
+        String insertSQL = String.format(SQL_TABLE_INSERT_TEMPLATE, currentTableName);
+        
+        try (PreparedStatement stmt = this.storageConnection.prepareStatement(insertSQL)) {
             for (int i = 0; i < count; i++) {
                 EnhancedLogEvent event = batch[i];
                 stmt.setString(1, event.localSourceIp);
@@ -409,7 +499,8 @@ class PostgreSQLActivityLogger implements ActivityStorage {
             }
             
             if (successCount != count) {
-                this.trace.writeLog("PostgreSQL batch insert: " + successCount + "/" + count + " events inserted successfully");
+                this.trace.writeLog("PostgreSQL batch insert to table '" + currentTableName + "': " + 
+                                  successCount + "/" + count + " events inserted successfully");
             }
             
         } catch (Exception e) {
@@ -437,7 +528,8 @@ class PostgreSQLActivityLogger implements ActivityStorage {
         if (count > 0) {
             try {
                 writeBatch(batch, count);
-                this.trace.writeLog("PostgreSQL flushed " + count + " remaining events during shutdown.");
+                this.trace.writeLog("PostgreSQL flushed " + count + " remaining events to table '" + 
+                                  currentTableName + "' during shutdown.");
             } catch (Exception e) {
                 this.trace.writeLog("Error flushing remaining PostgreSQL events: " + e.getMessage());
             }
@@ -453,8 +545,24 @@ class PostgreSQLActivityLogger implements ActivityStorage {
 
     /**
      * Save an activity event into the storage with enhanced details.
+     * NOW INCLUDES TABLE NAME SUPPORT
      */
     public void logEventEnhanced(HttpRequest request, HttpResponse response, String tool, long requestStartTime) throws Exception {
+        // Use the current table name (can be set via UI)
+        logEventEnhancedToTable(request, response, tool, requestStartTime, currentTableName);
+    }
+    
+    /**
+     * Save an activity event into a specific table with enhanced details.
+     * @param request The HTTP request
+     * @param response The HTTP response
+     * @param tool The Burp tool used
+     * @param requestStartTime Start time for response time calculation
+     * @param tableName Specific table name to use
+     * @throws Exception If logging fails
+     */
+    public void logEventEnhancedToTable(HttpRequest request, HttpResponse response, String tool, 
+                                       long requestStartTime, String tableName) throws Exception {
         try {
             // Calculate response time if we have a start time and response
             Long responseTimeMs = null;
@@ -492,7 +600,7 @@ class PostgreSQLActivityLogger implements ActivityStorage {
                 responseContentType = response.headerValue("Content-Type");
             }
 
-            // Create enhanced event object
+            // Create enhanced event object WITH TABLE NAME
             EnhancedLogEvent event = new EnhancedLogEvent(
                 InetAddress.getLocalHost().getHostAddress(),
                 request.url(),
@@ -517,7 +625,8 @@ class PostgreSQLActivityLogger implements ActivityStorage {
                 safeRequestRaw.isBase64Encoded,
                 safeRequestBody.isBase64Encoded,
                 safeResponseRaw.isBase64Encoded,
-                safeResponseBody.isBase64Encoded
+                safeResponseBody.isBase64Encoded,
+                tableName  // Added table name parameter
             );
             
             // Log if any content was Base64 encoded
@@ -596,18 +705,40 @@ class PostgreSQLActivityLogger implements ActivityStorage {
     }
 
     /**
-     * Extract and compute statistics about the DB.
+     * Extract and compute statistics about the DB for the current table.
      *
      * @return A VO object containing the statistics.
      * @throws Exception If computation meets an error.
      */
     public DBStats getEventsStats() throws Exception {
+        return getEventsStatsForTable(currentTableName);
+    }
+    
+    /**
+     * Extract and compute statistics about a specific table.
+     *
+     * @param tableName Name of the table to get statistics for
+     * @return A VO object containing the statistics.
+     * @throws Exception If computation meets an error.
+     */
+    public DBStats getEventsStatsForTable(String tableName) throws Exception {
         //Verify that the DB connection is still opened
         this.ensureDBState();
         
+        String safeTableName = sanitizeTableName(tableName);
+        
+        // Ensure the table exists before querying
+        createTableIfNotExists(safeTableName);
+        
+        // Build dynamic SQL queries
+        String countSQL = String.format(SQL_COUNT_RECORDS_TEMPLATE, safeTableName);
+        String totalDataSQL = String.format(SQL_TOTAL_AMOUNT_DATA_SENT_TEMPLATE, safeTableName);
+        String biggestRequestSQL = String.format(SQL_BIGGEST_REQUEST_AMOUNT_DATA_SENT_TEMPLATE, safeTableName);
+        String maxHitsSQL = String.format(SQL_MAX_HITS_BY_SECOND_TEMPLATE, safeTableName);
+        
         //Get the total of the records in the activity table
         long recordsCount;
-        try (PreparedStatement stmt = this.storageConnection.prepareStatement(SQL_COUNT_RECORDS)) {
+        try (PreparedStatement stmt = this.storageConnection.prepareStatement(countSQL)) {
             try (ResultSet rst = stmt.executeQuery()) {
                 recordsCount = rst.next() ? rst.getLong(1) : 0;
             }
@@ -620,7 +751,7 @@ class PostgreSQLActivityLogger implements ActivityStorage {
         
         if (recordsCount > 0) {
             //Get the total amount of data sent, we assume here that 1 character = 1 byte
-            try (PreparedStatement stmt = this.storageConnection.prepareStatement(SQL_TOTAL_AMOUNT_DATA_SENT)) {
+            try (PreparedStatement stmt = this.storageConnection.prepareStatement(totalDataSQL)) {
                 try (ResultSet rst = stmt.executeQuery()) {
                     if (rst.next()) {
                         totalAmountDataSent = rst.getLong(1);
@@ -629,7 +760,7 @@ class PostgreSQLActivityLogger implements ActivityStorage {
             }
             
             //Get the amount of data sent by the biggest request, we assume here that 1 character = 1 byte
-            try (PreparedStatement stmt = this.storageConnection.prepareStatement(SQL_BIGGEST_REQUEST_AMOUNT_DATA_SENT)) {
+            try (PreparedStatement stmt = this.storageConnection.prepareStatement(biggestRequestSQL)) {
                 try (ResultSet rst = stmt.executeQuery()) {
                     if (rst.next()) {
                         biggestRequestAmountDataSent = rst.getLong(1);
@@ -638,7 +769,7 @@ class PostgreSQLActivityLogger implements ActivityStorage {
             }
             
             //Get the maximum number of hits sent in a second
-            try (PreparedStatement stmt = this.storageConnection.prepareStatement(SQL_MAX_HITS_BY_SECOND)) {
+            try (PreparedStatement stmt = this.storageConnection.prepareStatement(maxHitsSQL)) {
                 try (ResultSet rst = stmt.executeQuery()) {
                     if (rst.next()) {
                         maxHitsBySecond = rst.getLong(1);
@@ -702,6 +833,7 @@ class PostgreSQLActivityLogger implements ActivityStorage {
 
     /**
      * Enhanced value object to hold event data for async processing
+     * NOW INCLUDES TABLE NAME FIELD
      */
     private static class EnhancedLogEvent {
         final String localSourceIp;
@@ -728,6 +860,7 @@ class PostgreSQLActivityLogger implements ActivityStorage {
         final boolean requestBodyIsBase64;
         final boolean responseRawIsBase64;
         final boolean responseBodyIsBase64;
+        final String targetTableName; // Added: Table name for this event
 
         EnhancedLogEvent(String localSourceIp, String targetUrl, String httpMethod, String tool,
                 String sendDateTime, String requestRaw, String requestHeaders, String requestBody,
@@ -735,7 +868,7 @@ class PostgreSQLActivityLogger implements ActivityStorage {
                 String responseBody, Integer responseSize, Integer httpStatusCode, String httpReasonPhrase,
                 String responseMimeType, String responseContentType, String httpVersion, Long responseTimeMs,
                 boolean requestRawIsBase64, boolean requestBodyIsBase64, boolean responseRawIsBase64, 
-                boolean responseBodyIsBase64) {
+                boolean responseBodyIsBase64, String targetTableName) { // Added parameter
             this.localSourceIp = localSourceIp;
             this.targetUrl = targetUrl;
             this.httpMethod = httpMethod;
@@ -760,6 +893,22 @@ class PostgreSQLActivityLogger implements ActivityStorage {
             this.requestBodyIsBase64 = requestBodyIsBase64;
             this.responseRawIsBase64 = responseRawIsBase64;
             this.responseBodyIsBase64 = responseBodyIsBase64;
+            this.targetTableName = targetTableName; // Store table name
+        }
+        
+        // Constructor overload for backward compatibility (uses default table)
+        EnhancedLogEvent(String localSourceIp, String targetUrl, String httpMethod, String tool,
+                String sendDateTime, String requestRaw, String requestHeaders, String requestBody,
+                Integer requestSize, String requestContentType, String responseRaw, String responseHeaders,
+                String responseBody, Integer responseSize, Integer httpStatusCode, String httpReasonPhrase,
+                String responseMimeType, String responseContentType, String httpVersion, Long responseTimeMs,
+                boolean requestRawIsBase64, boolean requestBodyIsBase64, boolean responseRawIsBase64, 
+                boolean responseBodyIsBase64) {
+            this(localSourceIp, targetUrl, httpMethod, tool, sendDateTime, requestRaw, requestHeaders, requestBody,
+                 requestSize, requestContentType, responseRaw, responseHeaders, responseBody, responseSize,
+                 httpStatusCode, httpReasonPhrase, responseMimeType, responseContentType, httpVersion,
+                 responseTimeMs, requestRawIsBase64, requestBodyIsBase64, responseRawIsBase64, 
+                 responseBodyIsBase64, "burp_activity"); // Default table name
         }
     }
-} 
+}
