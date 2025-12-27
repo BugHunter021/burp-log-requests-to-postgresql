@@ -10,6 +10,8 @@ import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JLabel;
 import javax.swing.JCheckBox;
+import javax.swing.JTextField;
+import javax.swing.JButton;
 import java.awt.Frame;
 import java.awt.event.ActionEvent;
 import java.util.ArrayList;
@@ -19,12 +21,16 @@ import java.util.Locale;
 import java.util.ResourceBundle;
 import java.awt.GridLayout;
 import java.io.File;
+import java.awt.BorderLayout;
+import java.awt.FlowLayout;
+import java.awt.Dimension;
 
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.persistence.Preferences;
 
 /**
  * Menu to configure the extension options.
+ * NOW INCLUDES DYNAMIC TABLE NAME CONFIGURATION
  */
 public class ConfigMenu implements Runnable {
 
@@ -62,6 +68,11 @@ public class ConfigMenu implements Runnable {
      * Expose the list of included tools when tool source filtering is enabled.
      */
     static final List<String> INCLUDED_TOOL_SOURCES = new ArrayList<>();
+
+    /**
+     * Expose the current table name for logging.
+     */
+    static volatile String CURRENT_TABLE_NAME = "burp_activity";
 
     /**
      * Option configuration key for the restriction of the logging of requests in defined target scope.
@@ -127,6 +138,11 @@ public class ConfigMenu implements Runnable {
      * Option configuration key for storing included tool sources.
      */
     public static final String INCLUDED_TOOL_SOURCES_CFG_KEY = "INCLUDED_TOOL_SOURCES";
+
+    /**
+     * Option configuration key for the current table name.
+     */
+    public static final String CURRENT_TABLE_NAME_CFG_KEY = "CURRENT_TABLE_NAME";
 
     /**
      * Extension root configuration menu.
@@ -196,6 +212,17 @@ public class ConfigMenu implements Runnable {
         INCLUDE_HTTP_RESPONSE_CONTENT = Boolean.TRUE.equals(this.preferences.getBoolean(INCLUDE_HTTP_RESPONSE_CONTENT_CFG_KEY));
         FILTER_BY_TOOL_SOURCE = Boolean.TRUE.equals(this.preferences.getBoolean(FILTER_BY_TOOL_SOURCE_CFG_KEY));
         
+        // Load current table name from preferences
+        String savedTableName = this.preferences.getString(CURRENT_TABLE_NAME_CFG_KEY);
+        if (savedTableName != null && !savedTableName.trim().isEmpty()) {
+            CURRENT_TABLE_NAME = savedTableName.trim();
+        } else {
+            CURRENT_TABLE_NAME = "burp_activity"; // Default
+        }
+        
+        // Update the PostgreSQL storage with the current table name if it supports dynamic tables
+        updateStorageTableName();
+        
         // Load included tool sources from preferences
         String includedToolsStr = this.preferences.getString(INCLUDED_TOOL_SOURCES_CFG_KEY);
         if (includedToolsStr != null && !includedToolsStr.trim().isEmpty()) {
@@ -211,6 +238,22 @@ public class ConfigMenu implements Runnable {
             Collections.addAll(INCLUDED_TOOL_SOURCES, "Proxy", "Repeater", "Intruder", "Scanner", "Sequencer", "Spider", "Target", "Extender");
         }
     }
+    
+    /**
+     * Update the storage handler with the current table name.
+     * Only works if the storage implements PostgreSQLActivityLogger interface.
+     */
+    private void updateStorageTableName() {
+        try {
+            if (this.activityStorage instanceof PostgreSQLActivityLogger) {
+                PostgreSQLActivityLogger pgStorage = (PostgreSQLActivityLogger) this.activityStorage;
+                pgStorage.setTableName(CURRENT_TABLE_NAME);
+                this.trace.writeLog("Table name updated in storage: " + CURRENT_TABLE_NAME);
+            }
+        } catch (Exception e) {
+            this.trace.writeLog("Could not update table name in storage: " + e.getMessage());
+        }
+    }
 
     /**
      * Build the options menu used to configure the extension.
@@ -219,8 +262,20 @@ public class ConfigMenu implements Runnable {
     public void run() {
         //Build the menu
         this.cfgMenu = new JMenu("Log Requests to Database");
+        
+        // Add the sub menu to set table name
+        String menuText = "Set Table Name";
+        final JMenuItem subMenuSetTableName = new JMenuItem(menuText);
+        subMenuSetTableName.addActionListener(new AbstractAction(menuText) {
+            public void actionPerformed(ActionEvent e) {
+                showTableNameDialog();
+            }
+        });
+        this.cfgMenu.add(subMenuSetTableName);
+        this.cfgMenu.addSeparator();
+        
         //Add the sub menu to restrict the logging of requests in defined target scope
-        String menuText = "Log only requests from defined target scope";
+        menuText = "Log only requests from defined target scope";
         final JCheckBoxMenuItem subMenuRestrictToScope = new JCheckBoxMenuItem(menuText, ONLY_INCLUDE_REQUESTS_FROM_SCOPE);
         subMenuRestrictToScope.addActionListener(new AbstractAction(menuText) {
             public void actionPerformed(ActionEvent e) {
@@ -236,6 +291,7 @@ public class ConfigMenu implements Runnable {
             }
         });
         this.cfgMenu.add(subMenuRestrictToScope);
+        
         //Add the sub menu to exclude the image resource requests from the logging.
         menuText = "Exclude the image resource requests";
         final JCheckBoxMenuItem subMenuExcludeImageResources = new JCheckBoxMenuItem(menuText, EXCLUDE_IMAGE_RESOURCE_REQUESTS);
@@ -253,6 +309,7 @@ public class ConfigMenu implements Runnable {
             }
         });
         this.cfgMenu.add(subMenuExcludeImageResources);
+        
         //Add the menu to include the HTTP responses content in the logging
         menuText = "Include the responses content";
         final JCheckBoxMenuItem subMenuIncludeHttpResponseContent = new JCheckBoxMenuItem(menuText, INCLUDE_HTTP_RESPONSE_CONTENT);
@@ -270,6 +327,7 @@ public class ConfigMenu implements Runnable {
             }
         });
         this.cfgMenu.add(subMenuIncludeHttpResponseContent);
+        
         //Add the menu to configure PostgreSQL connection
         menuText = "Configure PostgreSQL Connection";
         final JMenuItem subMenuConfigurePostgreSQL = new JMenuItem(menuText);
@@ -304,6 +362,7 @@ public class ConfigMenu implements Runnable {
             }
         });
         this.cfgMenu.add(subMenuConfigurePostgreSQL);
+        
         //Add the menu to filter by tool source
         menuText = "Select tools to log";
         final JCheckBoxMenuItem subMenuFilterByToolSource = new JCheckBoxMenuItem(menuText, FILTER_BY_TOOL_SOURCE);
@@ -332,6 +391,7 @@ public class ConfigMenu implements Runnable {
             }
         });
         this.cfgMenu.add(subMenuFilterByToolSource);
+        
         //Add the menu to pause the logging
         menuText = "Pause the logging";
         final JCheckBoxMenuItem subMenuPauseTheLogging = new JCheckBoxMenuItem(menuText, IS_LOGGING_PAUSED);
@@ -345,12 +405,13 @@ public class ConfigMenu implements Runnable {
                     ConfigMenu.this.preferences.setBoolean(PAUSE_LOGGING_CFG_KEY, Boolean.FALSE);
                     ConfigMenu.IS_LOGGING_PAUSED = Boolean.FALSE;
                     String dbPath = ConfigMenu.this.preferences.getString(ConfigMenu.DB_FILE_CUSTOM_LOCATION_CFG_KEY);
-                    String msg = "From now, logging is enabled and stored in database file '" + dbPath + "'.";
+                    String msg = "From now, logging is enabled and stored in table '" + CURRENT_TABLE_NAME + "'.";
                     ConfigMenu.this.trace.writeLog(msg);
                 }
             }
         });
         this.cfgMenu.add(subMenuPauseTheLogging);
+        
         //Add the sub menu to get statistics about the DB.
         menuText = "Get statistics about the logged events";
         final JMenuItem subMenuDBStatsMenuItem = new JMenuItem(menuText);
@@ -361,13 +422,14 @@ public class ConfigMenu implements Runnable {
                             //Get the data
                             DBStats stats = ConfigMenu.this.activityStorage.getEventsStats();
                             //Build the message
-                            String buffer = "Estimated database size: \n\r" + formatStat(stats.getSizeOnDisk()) + ".\n\r";
+                            String buffer = "Current table: " + CURRENT_TABLE_NAME + "\n\n";
+                            buffer += "Estimated database size: \n\r" + formatStat(stats.getSizeOnDisk()) + ".\n\r";
                             buffer += "Amount of data sent by the biggest HTTP request: \n\r" + formatStat(stats.getBiggestRequestSize()) + ".\n\r";
                             buffer += "Total amount of data sent via HTTP requests: \n\r" + formatStat(stats.getTotalRequestsSize()) + ".\n\r";
                             buffer += "Total number of records in the database: \n\r" + stats.getTotalRecordCount() + " HTTP requests.\n\r";
                             buffer += "Maximum number of hits sent in a second: \n\r" + stats.getMaxHitsBySecond() + " Hits.";
                             //Display the information via the UI
-                            JOptionPane.showMessageDialog(ConfigMenu.getBurpFrame(), buffer, "Events statistics", JOptionPane.INFORMATION_MESSAGE);
+                            JOptionPane.showMessageDialog(ConfigMenu.getBurpFrame(), buffer, "Events statistics for table: " + CURRENT_TABLE_NAME, JOptionPane.INFORMATION_MESSAGE);
                         } catch (Exception exp) {
                             ConfigMenu.this.trace.writeLog("Cannot obtains statistics about events: " + exp.getMessage());
                         }
@@ -378,6 +440,88 @@ public class ConfigMenu implements Runnable {
 
         //Register the menu in the UI.
         this.api.userInterface().menuBar().registerMenu(this.cfgMenu);
+    }
+
+    /**
+     * Show dialog to set the table name.
+     */
+    private void showTableNameDialog() {
+        JPanel panel = new JPanel(new BorderLayout(10, 10));
+        
+        // Create input panel
+        JPanel inputPanel = new JPanel(new GridLayout(2, 2, 5, 5));
+        inputPanel.add(new JLabel("Table Name:"));
+        JTextField tableNameField = new JTextField(CURRENT_TABLE_NAME, 20);
+        inputPanel.add(tableNameField);
+        
+        inputPanel.add(new JLabel("Valid characters:"));
+        inputPanel.add(new JLabel("a-z, A-Z, 0-9, _ (max 63 chars)"));
+        
+        panel.add(inputPanel, BorderLayout.CENTER);
+        
+        // Create info panel
+        JPanel infoPanel = new JPanel(new GridLayout(3, 1, 5, 5));
+        infoPanel.add(new JLabel("• Table will be created automatically if it doesn't exist"));
+        infoPanel.add(new JLabel("• Use different names for different targets"));
+        infoPanel.add(new JLabel("• Current table: " + CURRENT_TABLE_NAME));
+        
+        panel.add(infoPanel, BorderLayout.SOUTH);
+        
+        int result = JOptionPane.showConfirmDialog(
+            getBurpFrame(),
+            panel,
+            "Set Table Name",
+            JOptionPane.OK_CANCEL_OPTION,
+            JOptionPane.PLAIN_MESSAGE
+        );
+        
+        if (result == JOptionPane.OK_OPTION) {
+            String newTableName = tableNameField.getText().trim();
+            
+            if (newTableName.isEmpty()) {
+                JOptionPane.showMessageDialog(getBurpFrame(), 
+                    "Table name cannot be empty!", 
+                    "Invalid Table Name", 
+                    JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+            
+            // Validate table name format
+            if (!newTableName.matches("^[a-zA-Z_][a-zA-Z0-9_]*$")) {
+                JOptionPane.showMessageDialog(getBurpFrame(), 
+                    "Invalid table name!\n" +
+                    "Table names must start with a letter or underscore,\n" +
+                    "and contain only letters, numbers, and underscores.", 
+                    "Invalid Table Name", 
+                    JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+            
+            if (newTableName.length() > 63) {
+                JOptionPane.showMessageDialog(getBurpFrame(), 
+                    "Table name too long!\n" +
+                    "Maximum length is 63 characters.", 
+                    "Invalid Table Name", 
+                    JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+            
+            // Update table name
+            String oldTableName = CURRENT_TABLE_NAME;
+            CURRENT_TABLE_NAME = newTableName;
+            this.preferences.setString(CURRENT_TABLE_NAME_CFG_KEY, newTableName);
+            
+            // Update the storage handler
+            updateStorageTableName();
+            
+            this.trace.writeLog("Table name changed from '" + oldTableName + "' to '" + newTableName + "'");
+            
+            JOptionPane.showMessageDialog(getBurpFrame(), 
+                "Table name changed to: " + newTableName + "\n" +
+                "All future requests will be logged to this table.", 
+                "Table Name Updated", 
+                JOptionPane.INFORMATION_MESSAGE);
+        }
     }
 
     /**
@@ -445,6 +589,9 @@ public class ConfigMenu implements Runnable {
             // Replace storage instances
             this.activityStorage = newStorage;
             this.activityHttpListener.replaceStorage(newStorage);
+            
+            // Update new storage with current table name
+            updateStorageTableName();
             
             // Register new storage as unloading handler
             this.api.extension().registerUnloadingHandler(newStorage);
